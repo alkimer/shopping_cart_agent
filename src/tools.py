@@ -11,6 +11,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+
+from functools import lru_cache
+import os
+import torch
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
 _current_user_id: Optional[int] = None
 
 
@@ -179,7 +186,151 @@ def structured_search_tool(
     LLM Usage Note:
     This tool is ideal for filtered browsing, purchase history analysis, or category breakdowns.
     """
-    pass
+    """
+        Estructurada: filtra el catálogo y/o historial del usuario, con agregaciones opcionales.
+        Devuelve una lista de dicts (o error en un dict) según los parámetros.
+        """
+    try:
+        # -------- 1) Copias y normalización de tipos para merges --------
+        p = products.copy()
+        a = aisles.copy()
+        d = departments.copy()
+
+        for df, col in [(p, "aisle_id"), (p, "department_id"),
+                        (a, "aisle_id"), (d, "department_id")]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        p = p.dropna(subset=["aisle_id", "department_id"]).copy()
+        p["aisle_id"] = p["aisle_id"].astype("int64")
+        p["department_id"] = p["department_id"].astype("int64")
+        a["aisle_id"] = a["aisle_id"].astype("int64")
+        d["department_id"] = d["department_id"].astype("int64")
+
+        # -------- 2) Catálogo enriquecido --------
+        catalog = (
+            p.merge(a, on="aisle_id", how="left", validate="many_to_one")
+            .merge(d, on="department_id", how="left", validate="many_to_one")
+        )
+        catalog["product_name"] = catalog["product_name"].astype(str)
+        catalog["aisle"] = catalog["aisle"].astype(str).str.lower()
+        catalog["department"] = catalog["department"].astype(str).str.lower()
+
+        # -------- 3) Modo historial del usuario --------
+        if history_only:
+            uid = get_user_id() if get_user_id() is not None else DEFAULT_USER_ID
+
+            ords = orders.copy()
+            ords = ords[ords["user_id"] == uid]
+            ords["eval_set"] = ords["eval_set"].astype(str).str.strip().str.lower()
+            ords = ords[ords["eval_set"] == "prior"]
+            if ords.empty:
+                return [{"error": f"No order history found for user_id={uid}."}]
+
+            op = prior.copy()
+            op["order_id"] = pd.to_numeric(op["order_id"], errors="coerce")
+            op["product_id"] = pd.to_numeric(op["product_id"], errors="coerce")
+            op = op.dropna(subset=["order_id", "product_id"]).copy()
+            op["order_id"] = op["order_id"].astype("int64")
+            op["product_id"] = op["product_id"].astype("int64")
+
+            user_lines = op.merge(
+                ords[["order_id"]], on="order_id", how="inner", validate="many_to_one"
+            )
+            if user_lines.empty:
+                return [{"error": f"User {uid} has no prior order lines."}]
+
+            agg = user_lines.groupby("product_id", as_index=False).agg(
+                count=("product_id", "size"),
+                reordered_count=("reordered", "sum"),
+                add_to_cart_order=("add_to_cart_order", "mean"),
+            )
+
+            df = agg.merge(
+                catalog[["product_id", "product_name", "aisle", "department"]],
+                on="product_id",
+                how="left",
+                validate="many_to_one",
+            )
+
+            # -------- 4) Filtros --------
+            if product_name:
+                q = str(product_name).lower()
+                df = df[df["product_name"].str.lower().str.contains(q, na=False)]
+
+            if department:
+                df = df[df["department"].str.lower() == str(department).lower()]
+
+            if aisle:
+                df = df[df["aisle"].str.lower() == str(aisle).lower()]
+
+            if reordered is True:
+                df = df[df["reordered_count"] > 0]
+            elif reordered is False:
+                df = df[(df["count"] >= 1) & (df["reordered_count"] == 0)]
+
+            if isinstance(min_orders, int) and min_orders > 0:
+                df = df[df["count"] >= min_orders]
+
+            # -------- 5) Orden, top_k, group_by --------
+            if order_by in {"count", "add_to_cart_order"}:
+                df = df.sort_values(by=order_by, ascending=bool(ascending), kind="mergesort")
+
+            if isinstance(top_k, int) and top_k > 0:
+                df = df.head(top_k)
+
+            if group_by in {"department", "aisle"}:
+                grp = (
+                    df.groupby(group_by, as_index=False)
+                    .agg(num_products=("product_id", "nunique"))
+                    .sort_values("num_products", ascending=False)
+                )
+                return grp.to_dict(orient="records")
+
+            # -------- 6) Salida (mantener 'count' para tests) --------
+            cols = [
+                "product_id",
+                "product_name",
+                "aisle",
+                "department",
+                "count",
+                "reordered_count",
+                "add_to_cart_order",
+            ]
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = None
+            return df[cols].to_dict(orient="records")
+
+        # -------- 7) Catálogo completo (sin historial) --------
+        df = catalog.copy()
+
+        if product_name:
+            q = str(product_name).lower()
+            df = df[df["product_name"].str.lower().str.contains(q, na=False)]
+
+        if department:
+            df = df[df["department"].str.lower() == str(department).lower()]
+
+        if aisle:
+            df = df[df["aisle"].str.lower() == str(aisle).lower()]
+
+        if group_by in {"department", "aisle"}:
+            grp = (
+                df.groupby(group_by, as_index=False)
+                .agg(num_products=("product_id", "nunique"))
+                .sort_values("num_products", ascending=False)
+            )
+            if isinstance(top_k, int) and top_k > 0:
+                grp = grp.head(top_k)
+            return grp.to_dict(orient="records")
+
+        if isinstance(top_k, int) and top_k > 0:
+            df = df.head(top_k)
+
+        return df[["product_id", "product_name", "aisle", "department"]].to_dict(orient="records")
+
+    except Exception as e:
+        return [{"error": f"structured_search_tool failed: {repr(e)}"}]
 
 
 # TODO
@@ -234,8 +385,30 @@ _vector_store = None
 
 
 def get_vector_store():
-    pass
+    global _embeddings, _vector_store
 
+    if _vector_store is not None:
+        return _vector_store
+
+    if not os.path.isdir(CHROMA_DIR):
+        raise RuntimeError(
+            f"No se encontró la base vectorial en '{CHROMA_DIR}'. "
+            f"Ejecutá primero el script de construcción."
+        )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _embeddings = HuggingFaceEmbeddings(
+        model_name="mixedbread-ai/mxbai-embed-large-v1",
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    _vector_store = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        embedding_function=_embeddings,
+        persist_directory=CHROMA_DIR,
+    )
+    return _vector_store
 
 def make_query_prompt(query: str) -> str:
     return f"Represent this sentence for searching relevant passages: {query.strip().replace(chr(10), ' ')}"
@@ -284,7 +457,38 @@ def search_products(query: str, top_k: int = 5):
     ]
     ```
     """
-    pass
+    """
+    Perform a semantic vector search over the product catalog using HuggingFace embeddings and Chroma.
+    """
+    # Validación básica
+    if not isinstance(query, str) or not query.strip():
+        return []
+
+    # 1) Envolver la consulta
+    query_text = make_query_prompt(query)
+
+    # 2) Obtener el vector store
+    store = get_vector_store()
+
+    # 3) Ejecutar similarity_search
+    try:
+        k = max(1, int(top_k))
+    except Exception:
+        k = 5
+    docs = store.similarity_search(query_text, k=k)
+
+    # 4) Transformar a la salida requerida
+    results = []
+    for d in docs:
+        md = d.metadata or {}
+        results.append({
+            "product_id": int(md["product_id"]) if md.get("product_id") is not None else None,
+            "product_name": md.get("product_name", "") or "",
+            "aisle": md.get("aisle", "") or "",
+            "department": md.get("department", "") or "",
+            "text": d.page_content or "",
+        })
+    return results
 
 
 # TODO
@@ -343,8 +547,30 @@ def search_tool(query: str) -> str:
     search_tool("something high protein for breakfast")
     ```
     """
-    pass
+    # Ejecutar la búsqueda semántica
+    hits = search_products(query)
 
+    # Sin resultados
+    if not hits:
+        return "No products found matching your search."
+
+    # Formateo legible
+    lines = []
+    for h in hits:
+        pid = h.get("product_id")
+        pname = h.get("product_name", "")
+        aisle = h.get("aisle", "")
+        dept = h.get("department", "")
+        text = h.get("text", "")
+
+        lines.append(
+            f"- {pname} (ID: {pid})\n"
+            f"  Aisle: {aisle}\n"
+            f"  Department: {dept}\n"
+            f"  Details: {text}"
+        )
+
+    return "\n".join(lines)
 
 # ---- UPDATED: Cart tools with quantity support ----
 from typing import Any, Dict, Optional
@@ -495,7 +721,9 @@ def create_tool_node_with_fallback(tools: list) -> ToolNode:
     Returns:
     - ToolNode: A LangGraph-compatible tool node with error fallback logic.
     """
-    pass
+    node = ToolNode(tools)
+    # Attach a fallback runnable that will be called when an exception is stored under "error"
+    return node.with_fallbacks([RunnableLambda(handle_tool_error)], exception_key="error")
 
 
 __all__ = [
