@@ -5,7 +5,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
-
+from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage
 from .prompts import sales_rep_prompt, support_prompt
 from .state import State
 from .tools import (
@@ -46,7 +47,11 @@ support_runnable = support_prompt.partial(time=datetime.now) | llm.bind_tools(
 )
 
 # TODO
-def sales_assistant(state: State, config: RunnableConfig, runnable=sales_runnable) -> dict:
+async def sales_assistant(state: State, config: RunnableConfig, runnable=sales_runnable) -> dict:
+    """
+    LangGraph node function for running the sales assistant LLM agent (async).
+    """
+# def sales_assistant(state: State, config: RunnableConfig, runnable=sales_runnable) -> dict:
     """
     LangGraph node function for running the sales assistant LLM agent.
 
@@ -71,7 +76,35 @@ def sales_assistant(state: State, config: RunnableConfig, runnable=sales_runnabl
     - A dictionary with a `"messages"` key containing the new AI message(s).
     Example: `{"messages": [AIMessage(...)]}`
     """
-    pass
+    # 1) Contexto de hilo/usuario para las tools
+    try:
+        thread_id = config.get("configurable", {}).get("thread_id", None)
+    except AttributeError:
+        thread_id = None
+    if thread_id is None:
+        thread_id = "default-thread"
+    set_thread_id(thread_id)
+    set_user_id(DEFAULT_USER_ID)
+
+    # 2) Ejecutar el runnable (asincrónico)
+    result = await runnable.ainvoke(state, config=config)
+
+    # 3) Normalizar a {"messages": [...]}
+    if isinstance(result, dict) and "messages" in result:
+        return {"messages": result["messages"]}
+
+    if isinstance(result, BaseMessage):
+        return {"messages": [result]}
+
+    if isinstance(result, list):
+        # Puede venir lista de mensajes ya
+        if all(isinstance(x, BaseMessage) for x in result):
+            return {"messages": result}
+        # Si no, envolver en un AIMessage único
+        return {"messages": [AIMessage(content=str(result))]}
+
+    # Fallback final
+    return {"messages": [AIMessage(content=str(result))]}
 
 
 def support_assistant(state: State, config: RunnableConfig) -> dict:
